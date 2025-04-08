@@ -2,7 +2,30 @@ struct SDFHit
 {
     float dist;
     int material_id;
-};
+}
+
+struct CameraParams
+{
+    float3 pos;
+    float3 look_at;
+    float3 up;
+}
+
+struct InputCameraParams
+{
+    float pos_x, pos_y, pos_z;
+    float look_at_x, look_at_y, look_at_z;
+    float up_x, up_y, up_z;
+}
+
+CameraParams PackCameraParams(InputCameraParams input_params)
+{
+    CameraParams params;
+    params.pos = normalize(float3(input_params.pos_x, input_params.pos_y, input_params.pos_z));
+    params.look_at = normalize(float3(input_params.look_at_x, input_params.look_at_y, input_params.look_at_z));
+    params.up = normalize(float3(input_params.up_x, input_params.up_y, input_params.up_z));
+    return params;
+}
 
 SDFHit sdf_sphere(float3 p, float4 center_radius, int material_id)
 {
@@ -98,10 +121,15 @@ float raymarch(float3 ro, float3 rd, TensorView<float> objects, int obj_count, o
 
 [AutoPyBindCUDA]
 [CudaKernel]
-void render(TensorView<float> output, TensorView<float> objects, int obj_count)
+void render(TensorView<float> output,
+            TensorView<float> objects,
+            int obj_count,
+            InputCameraParams inp_camera_params)
 {
     uint3 gid = cudaBlockIdx() * cudaBlockDim() + cudaThreadIdx();
     if (gid.x >= output.size(0) || gid.y >= output.size(1)) return;
+
+    CameraParams cam_params = PackCameraParams(inp_camera_params);
 
     float2 res = float2(output.size(0), output.size(1));
     float2 uv = (float2(gid.x, gid.y) + 0.5) / res;
