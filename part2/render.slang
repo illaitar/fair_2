@@ -341,6 +341,52 @@ float3 shade_hit(float3 pos, float3 normal, float3 ray_dir, Material material,
     return material_color;
 }
 
+// Функция для преобразования направления луча в UV-координаты на сферической панораме
+float2 direction_to_equirect_uv(float3 direction)
+{
+    // Нормализация направления
+    float3 dir = normalize(direction);
+    
+    // Преобразование направления в сферические координаты
+    float phi = atan2(dir.z, dir.x);
+    float theta = asin(dir.y);
+    
+    // Преобразование в UV-координаты [0,1]
+    float u = (phi + 3.1415926) / (2.0 * 3.1415926);
+    float v = (theta + 3.1415926 / 2.0) / 3.1415926;
+    
+    return float2(u, v);
+}
+
+// Функция для семплирования сферической панорамы
+float3 sample_environment(TensorView<float> env_texture, float3 direction, int env_width, int env_height)
+{
+    // Получаем UV-координаты из направления луча
+    float2 uv = direction_to_equirect_uv(direction);
+    
+    // Преобразуем UV в координаты текстуры
+    int x = int(uv.x * env_width) % env_width;
+    int y = int(uv.y * env_height) % env_height;
+    
+    // Убедимся, что координаты положительные
+    if (x < 0) x += env_width;
+    if (y < 0) y += env_height;
+    
+    // Получаем пиксель из текстуры
+    int pixel_index = y * env_width + x;
+    if (pixel_index >= 0 && pixel_index < env_texture.size(0) && env_width > 0 && env_height > 0) {
+        return float3(
+            env_texture[pixel_index, 0],
+            env_texture[pixel_index, 1],
+            env_texture[pixel_index, 2]
+        );
+    } else {
+        // Если текстура недоступна, возвращаем градиентное небо
+        float t = 0.5 * (direction.y + 1.0);
+        return float3(1.0, 1.0, 1.0) * (1.0 - t) + float3(0.5, 0.7, 1.0) * t;
+    }
+}
+
 [AutoPyBindCUDA]
 [CudaKernel]
 void render(TensorView<float> output,
@@ -349,7 +395,10 @@ void render(TensorView<float> output,
             InputCameraParams inp_camera_params,
             TensorView<float> textures,
             TensorView<float> materials,
-            int materials_count)
+            int materials_count,
+            TensorView<float> env_texture,
+            int env_width,
+            int env_height)
 {
     uint3 gid = cudaBlockIdx() * cudaBlockDim() + cudaThreadIdx();
     if (gid.x >= output.size(0) || gid.y >= output.size(1)) return;
@@ -409,9 +458,8 @@ void render(TensorView<float> output,
         // Если луч не попал в объект, добавляем цвет фона и выходим
         if (dist < 0.0)
         {
-            // Фон (небо)
-            float t = 0.5 * (ray_dir.y + 1.0);
-            float3 sky_color = float3(1.0, 1.0, 1.0) * (1.0 - t) + float3(0.5, 0.7, 1.0) * t;
+            // Используем сферическую панораму как фон
+            float3 sky_color = sample_environment(env_texture, ray_dir, env_width, env_height);
             
             // Добавляем цвет фона с учетом текущего ослабления
             result_color = result_color + attenuation * sky_color;
