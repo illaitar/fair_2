@@ -21,8 +21,8 @@ struct InputCameraParams
 CameraParams PackCameraParams(InputCameraParams input_params)
 {
     CameraParams params;
-    params.pos = normalize(float3(input_params.pos_x, input_params.pos_y, input_params.pos_z));
-    params.look_at = normalize(float3(input_params.look_at_x, input_params.look_at_y, input_params.look_at_z));
+    params.pos = float3(input_params.pos_x, input_params.pos_y, input_params.pos_z);
+    params.look_at = float3(input_params.look_at_x, input_params.look_at_y, input_params.look_at_z);
     params.up = normalize(float3(input_params.up_x, input_params.up_y, input_params.up_z));
     return params;
 }
@@ -134,10 +134,10 @@ void render(TensorView<float> output,
     float2 res = float2(output.size(0), output.size(1));
     float2 uv = (float2(gid.x, gid.y) + 0.5) / res;
 
-    float3 cam_pos = float3(0.0, 0.0, -5.0);
-    float3 target = float3(0.0, 0.0, 0.0);
+    float3 cam_pos = float3(inp_camera_params.pos_x, inp_camera_params.pos_y, inp_camera_params.pos_z);
+    float3 target = float3(inp_camera_params.look_at_x, inp_camera_params.look_at_y, inp_camera_params.look_at_z);
     float3 f = normalize(target - cam_pos);
-    float3 up = float3(0.0, 1.0, 0.0);
+    float3 up = float3(inp_camera_params.up_x, inp_camera_params.up_y, inp_camera_params.up_z);
     float3 r = normalize(cross(f, up));
     float3 u = cross(r, f);
 
