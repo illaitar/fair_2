@@ -383,37 +383,143 @@ void render(TensorView<float> output,
         cam_up * y
     );
 
-    float3 pos, normal;
-    int mat_id;
-    float2 uv;
-    bool has_texture;
-    float texture_offset, texture_width, texture_height;
+    // Итеративная трассировка лучей с ограниченной глубиной
+    const int MAX_BOUNCES = 3; // Максимальное количество отражений/преломлений
     
-    float dist = raymarch(cam_pos, rd, objects, obj_count, pos, normal, mat_id, uv, has_texture, texture_offset, texture_width, texture_height);
-
-    float3 color;
+    // Начальные значения луча
+    float3 ray_origin = cam_pos;
+    float3 ray_dir = rd;
+    float3 result_color = float3(0.0, 0.0, 0.0);
+    float3 attenuation = float3(1.0, 1.0, 1.0); // Текущее ослабление луча
     
-    if (dist > 0.0) {
-        // Получаем материал объекта
-        Material material = get_material(materials, mat_id, materials_count);
+    // Итеративная трассировка с ограниченной глубиной
+    for (int bounce = 0; bounce < MAX_BOUNCES; bounce++)
+    {
+        // Трассируем текущий луч
+        float3 hit_pos, hit_normal;
+        int hit_mat_id;
+        float2 hit_uv;
+        bool hit_has_texture;
+        float hit_tex_offset, hit_tex_width, hit_tex_height;
         
-        // Вычисляем цвет с учетом материала и освещения
-        color = shade_hit(
-            pos, normal, rd, material,
-            uv, textures, texture_offset, texture_width, texture_height, has_texture,
-            objects, obj_count, cam_pos
-        );
-    } else {
-        // Фон (небо)
-        float t = 0.5 * (rd.y + 1.0);
-        // Линейная интерполяция: a * (1 - t) + b * t
-        color = float3(1.0, 1.0, 1.0) * (1.0 - t) + float3(0.5, 0.7, 1.0) * t;
+        float dist = raymarch(ray_origin, ray_dir, objects, obj_count, 
+                              hit_pos, hit_normal, hit_mat_id, hit_uv, 
+                              hit_has_texture, hit_tex_offset, hit_tex_width, hit_tex_height);
+        
+        // Если луч не попал в объект, добавляем цвет фона и выходим
+        if (dist < 0.0)
+        {
+            // Фон (небо)
+            float t = 0.5 * (ray_dir.y + 1.0);
+            float3 sky_color = float3(1.0, 1.0, 1.0) * (1.0 - t) + float3(0.5, 0.7, 1.0) * t;
+            
+            // Добавляем цвет фона с учетом текущего ослабления
+            result_color = result_color + attenuation * sky_color;
+            break;
+        }
+        
+        // Получаем материал объекта
+        Material material = get_material(materials, hit_mat_id, materials_count);
+        
+        // Базовый цвет материала (с учетом текстуры, если она есть)
+        float3 material_color = material.color;
+        if (material.has_texture && hit_has_texture) {
+            material_color = sample_texture(textures, hit_tex_offset, hit_tex_width, hit_tex_height, hit_uv);
+        }
+        
+        // Обработка в зависимости от типа материала
+        if (material.type == MATERIAL_DIFFUSE)
+        {
+            // Диффузный материал останавливает трассировку
+            float3 light_dir = normalize(float3(1.0, 1.0, 1.0));
+            float diffuse = max(0.2, dot(hit_normal, light_dir));
+            float3 ambient = float3(0.1, 0.1, 0.1);
+            
+            // Добавляем диффузный цвет с учетом текущего ослабления
+            result_color = result_color + attenuation * material_color * (ambient + diffuse);
+            break; // Конец трассировки для диффузных поверхностей
+        }
+        else if (material.type == MATERIAL_MIRROR)
+        {
+            // Отражение для зеркала
+            float3 reflect_dir = reflect_ray(ray_dir, hit_normal);
+            
+            // Настраиваем следующий луч как отраженный
+            ray_origin = hit_pos + hit_normal * 0.001; // Небольшое смещение для избежания самопересечения
+            ray_dir = reflect_dir;
+            
+            // Учитываем цвет зеркала в ослаблении
+            attenuation = attenuation * material_color;
+            
+            // Добавляем блик как часть отражения света
+            float3 light_dir = normalize(float3(1.0, 1.0, 1.0));
+            float light_reflection = pow(max(0.0, dot(reflect_dir, light_dir)), 8.0);
+            result_color = result_color + attenuation * float3(1.0, 1.0, 0.9) * light_reflection * 0.2;
+            
+            // Продолжаем трассировку
+        }
+        else if (material.type == MATERIAL_GLASS)
+        {
+            // Стеклянный материал (преломление с учетом френеля)
+            float refraction_index = max(1.01, material.param1);
+            if (refraction_index < 1.01) refraction_index = 1.5; // По умолчанию для стекла
+            
+            // Вычисляем коэффициент Френеля
+            float fresnel = 0.1 + 0.9 * pow(1.0 - max(0.0, -dot(ray_dir, hit_normal)), 5.0);
+            
+            // Решаем, будет ли отражение или преломление на основе коэффициента Френеля
+            if (bounce == MAX_BOUNCES - 1 || rand(float(gid.x) + float(gid.y) * 10.0 + float(bounce) * 100.0) < fresnel)
+            {
+                // Отражение (как у зеркала)
+                float3 reflect_dir = reflect_ray(ray_dir, hit_normal);
+                ray_origin = hit_pos + hit_normal * 0.001;
+                ray_dir = reflect_dir;
+            }
+            else
+            {
+                // Преломление
+                float3 refract_dir = refract_ray(ray_dir, hit_normal, 1.0 / refraction_index);
+                ray_origin = hit_pos - hit_normal * 0.001;
+                ray_dir = refract_dir;
+            }
+            
+            // Учитываем цвет стекла в ослаблении
+            attenuation = attenuation * material_color;
+            
+            // Продолжаем трассировку
+        }
+        else
+        {
+            // Неизвестный материал (обрабатываем как диффузный)
+            result_color = result_color + attenuation * material_color;
+            break;
+        }
+        
+        // Проверка на слишком сильное ослабление (оптимизация)
+        if (max(max(attenuation.x, attenuation.y), attenuation.z) < 0.01)
+            break;
     }
     
     // Простая коррекция гаммы
-    color = pow(color, float3(1.0/2.2));
+    result_color = pow(result_color, float3(1.0/2.2));
     
-    output[int3(gid.xy, 0)] = color.x;
-    output[int3(gid.xy, 1)] = color.y;
-    output[int3(gid.xy, 2)] = color.z;
+    // Клампим цвет для безопасности
+    result_color = min(result_color, float3(1.0, 1.0, 1.0));
+    
+    output[int3(gid.xy, 0)] = result_color.x;
+    output[int3(gid.xy, 1)] = result_color.y;
+    output[int3(gid.xy, 2)] = result_color.z;
+}
+
+// Функция для получения дробной части числа
+float frac(float x)
+{
+    return x - floor(x);
+}
+
+// Простая функция псевдо-случайных чисел (для вероятностных решений)
+float rand(float seed)
+{
+    float a = sin(seed) * 43758.5453;
+    return frac(a);
 }
