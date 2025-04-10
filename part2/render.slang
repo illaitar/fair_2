@@ -435,7 +435,8 @@ void render(TensorView<float> output,
             TensorView<float> env_texture,
             int env_width,
             int env_height,
-            bool path_tracing)
+            bool path_tracing,
+            uint seed)
 {
     uint3 gid = cudaBlockIdx() * cudaBlockDim() + cudaThreadIdx();
     if (gid.x >= output.size(0) || gid.y >= output.size(1)) return;
@@ -480,7 +481,7 @@ void render(TensorView<float> output,
     float3 attenuation = float3(1.0, 1.0, 1.0); // Текущее ослабление луча
     
     // Инициализируем seed для случайных чисел
-    uint seed = uint(gid.x + gid.y * output.size(0)) * 719393 + 1337;
+    // uint seed = uint(gid.x + gid.y * output.size(0)) * 719393 + 1337;
     
     // Итеративная трассировка с ограниченной глубиной
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++)
