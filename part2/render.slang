@@ -12,16 +12,19 @@ struct Material
     float param2;      // Дополнительный параметр 2
 };
 
-struct SDFHit
+struct HitInfo
 {
-    float dist;
+    bool didHit;
+    float dst;
+    float3 hitPoint;
+    float3 normal;
     int material_id;
     bool has_texture;
     float texture_offset;
     float texture_width;
     float texture_height;
-    float2 uv; // Текстурные координаты
-}
+    float2 uv;
+};
 
 struct CameraParams
 {
@@ -49,7 +52,6 @@ CameraParams PackCameraParams(InputCameraParams input_params)
     return params;
 }
 
-// Функция для генерации UV-координат для сферы
 float2 sphere_uv(float3 p, float3 center)
 {
     float3 dir = normalize(p - center);
@@ -59,14 +61,11 @@ float2 sphere_uv(float3 p, float3 center)
     return uv;
 }
 
-// Функция для генерации UV-координат для плоскости
 float2 plane_uv(float3 p, float3 point, float3 normal)
 {
-    // Создаем локальную систему координат на плоскости
     float3 tangent, bitangent;
     float3 up = float3(0, 1, 0);
     
-    // Если нормаль параллельна вектору up, используем другой вектор
     if (abs(dot(normal, up)) > 0.99)
         tangent = normalize(cross(normal, float3(1, 0, 0)));
     else
@@ -74,20 +73,20 @@ float2 plane_uv(float3 p, float3 point, float3 normal)
     
     bitangent = normalize(cross(normal, tangent));
     
-    // Проецируем точку на плоскость
     float3 local_p = p - point;
     float2 uv;
-    uv.x = dot(local_p, tangent) * 0.2; // Масштабируем для повторения текстуры
-    uv.y = dot(local_p, bitangent) * 0.2;
-    
-    // Возвращаем дробную часть для повторения текстуры
+    uv.x = dot(local_p, tangent) * 0.01;
+    uv.y = dot(local_p, bitangent) * 0.01;
     return float2(frac(uv.x), frac(uv.y));
 }
 
-SDFHit sdf_sphere(float3 p, float4 center_radius, int material_id, bool has_texture, float texture_offset, float texture_width, float texture_height)
+HitInfo sdf_sphere(float3 p, float4 center_radius, int material_id, bool has_texture, float texture_offset, float texture_width, float texture_height)
 {
-    SDFHit hit;
-    hit.dist = length(p - center_radius.xyz) - center_radius.w;
+    HitInfo hit;
+    hit.dst = length(p - center_radius.xyz) - center_radius.w;
+    hit.didHit = false; // Will be set later during raymarching
+    hit.hitPoint = float3(0.0);
+    hit.normal = float3(0.0);
     hit.material_id = material_id;
     hit.has_texture = has_texture;
     hit.texture_offset = texture_offset;
@@ -97,10 +96,13 @@ SDFHit sdf_sphere(float3 p, float4 center_radius, int material_id, bool has_text
     return hit;
 }
 
-SDFHit sdf_plane(float3 p, float3 point, float3 normal, int material_id, bool has_texture, float texture_offset, float texture_width, float texture_height)
+HitInfo sdf_plane(float3 p, float3 point, float3 normal, int material_id, bool has_texture, float texture_offset, float texture_width, float texture_height)
 {
-    SDFHit hit;
-    hit.dist = dot(p - point, normalize(normal));
+    HitInfo hit;
+    hit.dst = dot(p - point, normalize(normal));
+    hit.didHit = false; // Will be set later during raymarching
+    hit.hitPoint = float3(0.0);
+    hit.normal = normalize(normal);
     hit.material_id = material_id;
     hit.has_texture = has_texture;
     hit.texture_offset = texture_offset;
@@ -110,15 +112,18 @@ SDFHit sdf_plane(float3 p, float3 point, float3 normal, int material_id, bool ha
     return hit;
 }
 
-SDFHit sdf_union(SDFHit a, SDFHit b)
+HitInfo sdf_union(HitInfo a, HitInfo b)
 {
-    return (a.dist < b.dist) ? a : b;
+    return (a.dst < b.dst) ? a : b;
 }
 
-SDFHit scene_sdf(float3 p, TensorView<float> objects, int obj_count)
+HitInfo scene_sdf(float3 p, TensorView<float> objects, int obj_count)
 {
-    SDFHit hit;
-    hit.dist = 1e10;
+    HitInfo hit;
+    hit.dst = 1e10;
+    hit.didHit = false;
+    hit.hitPoint = float3(0.0);
+    hit.normal = float3(0.0, 1.0, 0.0);
     hit.material_id = -1;
     hit.has_texture = false;
     hit.texture_offset = 0;
@@ -139,7 +144,7 @@ SDFHit scene_sdf(float3 p, TensorView<float> objects, int obj_count)
         float texture_width = objects[i, 12];
         float texture_height = objects[i, 13];
 
-        SDFHit current;
+        HitInfo current;
 
         if (type == 0)
             current = sdf_plane(p, data0.xyz, data1.xyz, mat_id, has_texture, texture_offset, texture_width, texture_height);
@@ -155,78 +160,78 @@ SDFHit scene_sdf(float3 p, TensorView<float> objects, int obj_count)
 // Функция для извлечения текстуры из буфера
 float3 sample_texture(TensorView<float> textures, float texture_offset, float texture_width, float texture_height, float2 uv)
 {
-    // Убедимся, что UV находятся в диапазоне [0,1]
     uv = float2(frac(uv.x), frac(uv.y));
-    
-    // Вычисляем координаты пикселя
     int x = int(uv.x * texture_width);
     int y = int(uv.y * texture_height);
-    
-    // Клампим к размерам текстуры
     x = min(max(x, 0), int(texture_width) - 1);
     y = min(max(y, 0), int(texture_height) - 1);
-    
-    // Вычисляем индекс пикселя в буфере
     int pixel_index = int(texture_offset) + y * int(texture_width) + x;
     
-    // Безопасная проверка границ
     if (pixel_index >= 0 && pixel_index < textures.size(0))
         return float3(textures[pixel_index, 0], textures[pixel_index, 1], textures[pixel_index, 2]);
     else
         return float3(1, 0, 1); // Пурпурный для отладки
 }
 
-float raymarch(float3 ro, float3 rd, TensorView<float> objects, int obj_count, out float3 hitPos, out float3 normal, out int material_id, out float2 uv, out bool has_texture, out float texture_offset, out float texture_width, out float texture_height)
+struct Ray
+{
+    float3 origin;
+    float3 dir;
+}
+
+HitInfo raymarch(Ray ray, TensorView<float> objects, int obj_count)
 {
     const int maxSteps = 128;
     const float maxDist = 100.0;
     const float epsilon = 0.001;
 
     float t = 0.0;
+    
+    HitInfo finalHit;
+    finalHit.didHit = false;
+    finalHit.dst = -1.0;
+    finalHit.hitPoint = float3(0.0);
+    finalHit.normal = float3(0.0, 1.0, 0.0);
+    finalHit.material_id = -1;
+    finalHit.has_texture = false;
+    finalHit.texture_offset = 0;
+    finalHit.texture_width = 0;
+    finalHit.texture_height = 0;
+    finalHit.uv = float2(0, 0);
 
     for (int i = 0; i < maxSteps; ++i)
     {
-        float3 p = ro + t * rd;
-        SDFHit hit = scene_sdf(p, objects, obj_count);
+        float3 p = ray.origin + t * ray.dir;
+        HitInfo hit = scene_sdf(p, objects, obj_count);
 
-        if (hit.dist < epsilon)
+        if (hit.dst < epsilon)
         {
-            hitPos = p;
-            material_id = hit.material_id;
-            uv = hit.uv;
-            has_texture = hit.has_texture;
-            texture_offset = hit.texture_offset;
-            texture_width = hit.texture_width;
-            texture_height = hit.texture_height;
+            finalHit = hit;
+            finalHit.didHit = true;
+            finalHit.dst = t;
+            finalHit.hitPoint = p;
 
+            // Calculate normal using finite difference
             float h = 0.001;
             float3 dx = float3(h, 0, 0);
             float3 dy = float3(0, h, 0);
             float3 dz = float3(0, 0, h);
 
-            normal = normalize(float3(
-                scene_sdf(p + dx, objects, obj_count).dist - scene_sdf(p - dx, objects, obj_count).dist,
-                scene_sdf(p + dy, objects, obj_count).dist - scene_sdf(p - dy, objects, obj_count).dist,
-                scene_sdf(p + dz, objects, obj_count).dist - scene_sdf(p - dz, objects, obj_count).dist
+            finalHit.normal = normalize(float3(
+                scene_sdf(p + dx, objects, obj_count).dst - scene_sdf(p - dx, objects, obj_count).dst,
+                scene_sdf(p + dy, objects, obj_count).dst - scene_sdf(p - dy, objects, obj_count).dst,
+                scene_sdf(p + dz, objects, obj_count).dst - scene_sdf(p - dz, objects, obj_count).dst
             ));
 
-            return t;
+            return finalHit;
         }
 
-        t += hit.dist;
+        t += hit.dst;
         if (t > maxDist)
             break;
     }
 
-    hitPos = float3(0.0);
-    normal = float3(0.0, 1.0, 0.0);
-    material_id = -1;
-    uv = float2(0, 0);
-    has_texture = false;
-    texture_offset = 0;
-    texture_width = 0;
-    texture_height = 0;
-    return -1.0;
+    return finalHit; // No hit found
 }
 
 // Функция для получения материала по его id
@@ -387,6 +392,37 @@ float3 sample_environment(TensorView<float> env_texture, float3 direction, int e
     }
 }
 
+// Функция для генерации случайного направления в полусфере вокруг нормали
+float3 random_hemisphere_direction(float3 normal, uint seed)
+{
+    // Генерируем два случайных числа для сферических координат
+    float rand1 = RandomValue(seed);
+    float rand2 = RandomValue(seed);
+    
+    // Преобразуем в направление в локальной системе координат полусферы
+    float cos_theta = sqrt(1.0 - rand1);
+    float sin_theta = sqrt(rand1);
+    float phi = 2.0 * 3.1415926 * rand2;
+    
+    float3 direction = float3(
+        sin_theta * cos(phi),
+        cos_theta,               // Y is up in local space
+        sin_theta * sin(phi)
+    );
+    
+    // Создаем ортонормированный базис вокруг нормали
+    float3 up = abs(normal.y) > 0.999 ? float3(1, 0, 0) : float3(0, 1, 0);
+    float3 tangent = normalize(cross(up, normal));
+    float3 bitangent = cross(normal, tangent);
+    
+    // Преобразуем из локальной системы координат в мировую
+    return normalize(
+        tangent * direction.x +
+        normal * direction.y +
+        bitangent * direction.z
+    );
+}
+
 [AutoPyBindCUDA]
 [CudaKernel]
 void render(TensorView<float> output,
@@ -398,7 +434,8 @@ void render(TensorView<float> output,
             int materials_count,
             TensorView<float> env_texture,
             int env_width,
-            int env_height)
+            int env_height,
+            bool path_tracing)
 {
     uint3 gid = cudaBlockIdx() * cudaBlockDim() + cudaThreadIdx();
     if (gid.x >= output.size(0) || gid.y >= output.size(1)) return;
@@ -433,33 +470,29 @@ void render(TensorView<float> output,
     );
 
     // Итеративная трассировка лучей с ограниченной глубиной
-    const int MAX_BOUNCES = 3; // Максимальное количество отражений/преломлений
+    const int MAX_BOUNCES = 5; // Максимальное количество отражений/преломлений
     
     // Начальные значения луча
-    float3 ray_origin = cam_pos;
-    float3 ray_dir = rd;
+    Ray ray;
+    ray.origin = cam_pos;
+    ray.dir = rd;
     float3 result_color = float3(0.0, 0.0, 0.0);
     float3 attenuation = float3(1.0, 1.0, 1.0); // Текущее ослабление луча
+    
+    // Инициализируем seed для случайных чисел
+    uint seed = uint(gid.x + gid.y * output.size(0)) * 719393 + 1337;
     
     // Итеративная трассировка с ограниченной глубиной
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++)
     {
         // Трассируем текущий луч
-        float3 hit_pos, hit_normal;
-        int hit_mat_id;
-        float2 hit_uv;
-        bool hit_has_texture;
-        float hit_tex_offset, hit_tex_width, hit_tex_height;
-        
-        float dist = raymarch(ray_origin, ray_dir, objects, obj_count, 
-                              hit_pos, hit_normal, hit_mat_id, hit_uv, 
-                              hit_has_texture, hit_tex_offset, hit_tex_width, hit_tex_height);
+        HitInfo hit = raymarch(ray, objects, obj_count);
         
         // Если луч не попал в объект, добавляем цвет фона и выходим
-        if (dist < 0.0)
+        if (!hit.didHit)
         {
             // Используем сферическую панораму как фон
-            float3 sky_color = sample_environment(env_texture, ray_dir, env_width, env_height);
+            float3 sky_color = sample_environment(env_texture, ray.dir, env_width, env_height);
             
             // Добавляем цвет фона с учетом текущего ослабления
             result_color = result_color + attenuation * sky_color;
@@ -467,44 +500,66 @@ void render(TensorView<float> output,
         }
         
         // Получаем материал объекта
-        Material material = get_material(materials, hit_mat_id, materials_count);
+        Material material = get_material(materials, hit.material_id, materials_count);
         
         // Базовый цвет материала (с учетом текстуры, если она есть)
         float3 material_color = material.color;
-        if (material.has_texture && hit_has_texture) {
-            material_color = sample_texture(textures, hit_tex_offset, hit_tex_width, hit_tex_height, hit_uv);
+        if (material.has_texture && hit.has_texture) {
+            material_color = sample_texture(textures, hit.texture_offset, hit.texture_width, hit.texture_height, hit.uv);
         }
         
         // Обработка в зависимости от типа материала
         if (material.type == MATERIAL_DIFFUSE)
         {
-            // Диффузный материал останавливает трассировку
-            float3 light_dir = normalize(float3(1.0, 1.0, 1.0));
-            float diffuse = max(0.2, dot(hit_normal, light_dir));
-            float3 ambient = float3(0.1, 0.1, 0.1);
-            
-            // Добавляем диффузный цвет с учетом текущего ослабления
-            result_color = result_color + attenuation * material_color * (ambient + diffuse);
-            break; // Конец трассировки для диффузных поверхностей
+            if (path_tracing)
+            {
+                // Path tracing - случайное направление в полусфере вокруг нормали
+                float3 random_dir = random_hemisphere_direction(hit.normal, seed);
+                
+                // Настраиваем следующий луч
+                ray.origin = hit.hitPoint + hit.normal * 0.001; // Небольшое смещение
+                ray.dir = random_dir;
+                
+                // Ослабляем цвет по закону Ламберта (косинус угла между нормалью и направлением)
+                float cos_theta = max(0.0, dot(hit.normal, random_dir));
+                attenuation = attenuation * material_color * cos_theta;
+                
+                // Для оптимизации добавляем ambient для первого отражения
+                if (bounce == 0) {
+                    float3 ambient = float3(0.1, 0.1, 0.1);
+                    result_color = result_color + attenuation * ambient;
+                }
+            }
+            else
+            {
+                // Обычный рейтрейсинг с простым диффузным затенением
+                float3 light_dir = normalize(float3(1.0, 1.0, 1.0));
+                float diffuse = max(0.2, dot(hit.normal, light_dir));
+                float3 ambient = float3(0.1, 0.1, 0.1);
+                
+                // Добавляем диффузный цвет с учетом текущего ослабления
+                result_color = result_color + attenuation * material_color * (ambient + diffuse);
+                break; // Конец трассировки для диффузных поверхностей в обычном режиме
+            }
         }
         else if (material.type == MATERIAL_MIRROR)
         {
             // Отражение для зеркала
-            float3 reflect_dir = reflect_ray(ray_dir, hit_normal);
+            float3 reflect_dir = reflect_ray(ray.dir, hit.normal);
             
             // Настраиваем следующий луч как отраженный
-            ray_origin = hit_pos + hit_normal * 0.001; // Небольшое смещение для избежания самопересечения
-            ray_dir = reflect_dir;
+            ray.origin = hit.hitPoint + hit.normal * 0.001; // Небольшое смещение для избежания самопересечения
+            ray.dir = reflect_dir;
             
             // Учитываем цвет зеркала в ослаблении
             attenuation = attenuation * material_color;
             
-            // Добавляем блик как часть отражения света
-            float3 light_dir = normalize(float3(1.0, 1.0, 1.0));
-            float light_reflection = pow(max(0.0, dot(reflect_dir, light_dir)), 8.0);
-            result_color = result_color + attenuation * float3(1.0, 1.0, 0.9) * light_reflection * 0.2;
-            
-            // Продолжаем трассировку
+            // В режиме обычного рейтрейсинга добавляем блик
+            if (!path_tracing) {
+                float3 light_dir = normalize(float3(1.0, 1.0, 1.0));
+                float light_reflection = pow(max(0.0, dot(reflect_dir, light_dir)), 8.0);
+                result_color = result_color + attenuation * float3(1.0, 1.0, 0.9) * light_reflection * 0.2;
+            }
         }
         else if (material.type == MATERIAL_GLASS)
         {
@@ -513,34 +568,49 @@ void render(TensorView<float> output,
             if (refraction_index < 1.01) refraction_index = 1.5; // По умолчанию для стекла
             
             // Вычисляем коэффициент Френеля
-            float fresnel = 0.1 + 0.9 * pow(1.0 - max(0.0, -dot(ray_dir, hit_normal)), 5.0);
+            float fresnel = 0.1 + 0.9 * pow(1.0 - max(0.0, -dot(ray.dir, hit.normal)), 5.0);
             
             // Решаем, будет ли отражение или преломление на основе коэффициента Френеля
-            if (bounce == MAX_BOUNCES - 1 || rand(float(gid.x) + float(gid.y) * 10.0 + float(bounce) * 100.0) < fresnel)
+            if (bounce == MAX_BOUNCES - 1 || RandomValue(seed) < fresnel)
             {
                 // Отражение (как у зеркала)
-                float3 reflect_dir = reflect_ray(ray_dir, hit_normal);
-                ray_origin = hit_pos + hit_normal * 0.001;
-                ray_dir = reflect_dir;
+                float3 reflect_dir = reflect_ray(ray.dir, hit.normal);
+                ray.origin = hit.hitPoint + hit.normal * 0.001;
+                ray.dir = reflect_dir;
             }
             else
             {
                 // Преломление
-                float3 refract_dir = refract_ray(ray_dir, hit_normal, 1.0 / refraction_index);
-                ray_origin = hit_pos - hit_normal * 0.001;
-                ray_dir = refract_dir;
+                float3 refract_dir = refract_ray(ray.dir, hit.normal, 1.0 / refraction_index);
+                ray.origin = hit.hitPoint - hit.normal * 0.001;
+                ray.dir = refract_dir;
             }
             
             // Учитываем цвет стекла в ослаблении
             attenuation = attenuation * material_color;
-            
-            // Продолжаем трассировку
         }
         else
         {
             // Неизвестный материал (обрабатываем как диффузный)
-            result_color = result_color + attenuation * material_color;
-            break;
+            if (path_tracing)
+            {
+                // Path tracing - случайное направление в полусфере
+                float3 random_dir = random_hemisphere_direction(hit.normal, seed);
+                
+                // Настраиваем следующий луч
+                ray.origin = hit.hitPoint + hit.normal * 0.001;
+                ray.dir = random_dir;
+                
+                // Ослабляем цвет по закону Ламберта
+                float cos_theta = max(0.0, dot(hit.normal, random_dir));
+                attenuation = attenuation * material_color * cos_theta;
+            }
+            else
+            {
+                // Обычный режим - просто берем цвет материала
+                result_color = result_color + attenuation * material_color;
+                break;
+            }
         }
         
         // Проверка на слишком сильное ослабление (оптимизация)
@@ -570,4 +640,12 @@ float rand(float seed)
 {
     float a = sin(seed) * 43758.5453;
     return frac(a);
+}
+
+float RandomValue(inout uint state)
+{
+    state = state * 747796405 + 2891336453;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+    result = (result >> 22) ^ result;
+    return result / 4294967295.0;
 }
