@@ -2,6 +2,7 @@
 static const int MATERIAL_DIFFUSE = 0;
 static const int MATERIAL_MIRROR = 1;
 static const int MATERIAL_GLASS = 2;
+static const float PI = 3.14159265358979323846;
 
 struct Material
 {
@@ -61,10 +62,9 @@ float2 sphere_uv(float3 p, float3 center)
     return uv;
 }
 
-float2 plane_uv(float3 p, float3 point, float3 normal)
+float2 plane_uv(float3 p, float3 point, float3 normal, float tiling_scale = 0.01, float2 offset = float2(0.1, 0.1))
 {
     float3 tangent, bitangent;
-    float2 offset = float2(0.1, 0.1);
     float3 up = float3(0, 1, 0);
     
     if (abs(dot(normal, up)) > 0.99)
@@ -76,8 +76,8 @@ float2 plane_uv(float3 p, float3 point, float3 normal)
     
     float3 local_p = p - point;
     float2 uv;
-    uv.x = dot(local_p, tangent) * 0.01;
-    uv.y = dot(local_p, bitangent) * 0.01;
+    uv.x = dot(local_p, tangent) * tiling_scale;
+    uv.y = dot(local_p, bitangent) * tiling_scale;
     
     // Добавляем смещение перед применением frac
     return frac(uv + offset);
@@ -100,7 +100,7 @@ HitInfo sdf_sphere(float3 p, float4 center_radius, int material_id, bool has_tex
     return hit;
 }
 
-HitInfo sdf_plane(float3 p, float3 point, float3 normal, int material_id, bool has_texture, float texture_offset, float texture_width, float texture_height)
+HitInfo sdf_plane(float3 p, float3 point, float3 normal, int material_id, bool has_texture, float texture_offset, float texture_width, float texture_height, float tiling_scale = 0.01, float2 offset = float2(0.1, 0.1))
 {
     HitInfo hit;
     hit.dst = dot(p - point, normalize(normal));
@@ -112,7 +112,7 @@ HitInfo sdf_plane(float3 p, float3 point, float3 normal, int material_id, bool h
     hit.texture_offset = texture_offset;
     hit.texture_width = texture_width;
     hit.texture_height = texture_height;
-    hit.uv = plane_uv(p, point, normal);
+    hit.uv = plane_uv(p, point, normal, tiling_scale, offset);
     return hit;
 }
 
@@ -121,7 +121,7 @@ HitInfo sdf_union(HitInfo a, HitInfo b)
     return (a.dst < b.dst) ? a : b;
 }
 
-HitInfo scene_sdf(float3 p, TensorView<float> objects, int obj_count)
+HitInfo scene_sdf(float3 p, TensorView<float> objects, int obj_count, float plane_tiling_scale = 0.01, float2 plane_offset = float2(0.1, 0.1))
 {
     HitInfo hit;
     hit.dst = 1e10;
@@ -151,7 +151,7 @@ HitInfo scene_sdf(float3 p, TensorView<float> objects, int obj_count)
         HitInfo current;
 
         if (type == 0)
-            current = sdf_plane(p, data0.xyz, data1.xyz, mat_id, has_texture, texture_offset, texture_width, texture_height);
+            current = sdf_plane(p, data0.xyz, data1.xyz, mat_id, has_texture, texture_offset, texture_width, texture_height, plane_tiling_scale, plane_offset);
         else if (type == 1)
             current = sdf_sphere(p, data0, mat_id, has_texture, texture_offset, texture_width, texture_height);
 
@@ -183,7 +183,7 @@ struct Ray
     float3 dir;
 }
 
-HitInfo raymarch(Ray ray, TensorView<float> objects, int obj_count)
+HitInfo raymarch(Ray ray, TensorView<float> objects, int obj_count, float plane_tiling_scale = 0.01, float2 plane_offset = float2(0.1, 0.1))
 {
     const int maxSteps = 256;
     const float maxDist = 100.0;
@@ -206,7 +206,7 @@ HitInfo raymarch(Ray ray, TensorView<float> objects, int obj_count)
     for (int i = 0; i < maxSteps; ++i)
     {
         float3 p = ray.origin + t * ray.dir;
-        HitInfo hit = scene_sdf(p, objects, obj_count);
+        HitInfo hit = scene_sdf(p, objects, obj_count, plane_tiling_scale, plane_offset);
 
         if (hit.dst < epsilon)
         {
@@ -222,9 +222,9 @@ HitInfo raymarch(Ray ray, TensorView<float> objects, int obj_count)
             float3 dz = float3(0, 0, h);
 
             finalHit.normal = normalize(float3(
-                scene_sdf(p + dx, objects, obj_count).dst - scene_sdf(p - dx, objects, obj_count).dst,
-                scene_sdf(p + dy, objects, obj_count).dst - scene_sdf(p - dy, objects, obj_count).dst,
-                scene_sdf(p + dz, objects, obj_count).dst - scene_sdf(p - dz, objects, obj_count).dst
+                scene_sdf(p + dx, objects, obj_count, plane_tiling_scale, plane_offset).dst - scene_sdf(p - dx, objects, obj_count, plane_tiling_scale, plane_offset).dst,
+                scene_sdf(p + dy, objects, obj_count, plane_tiling_scale, plane_offset).dst - scene_sdf(p - dy, objects, obj_count, plane_tiling_scale, plane_offset).dst,
+                scene_sdf(p + dz, objects, obj_count, plane_tiling_scale, plane_offset).dst - scene_sdf(p - dz, objects, obj_count, plane_tiling_scale, plane_offset).dst
             ));
 
             return finalHit;
@@ -285,28 +285,67 @@ float3 refract_ray(float3 incident, float3 normal, float eta)
     return reflect_ray(incident, normal);
 }
 
+// Функция для вращения вектора вокруг осей
+float3 rotate_direction(float3 dir, float rot_x, float rot_y, float rot_z)
+{
+    // Вращение вокруг оси X (наклон вверх/вниз)
+    float cos_x = cos(rot_x);
+    float sin_x = sin(rot_x);
+    float3 dir_x = float3(
+        dir.x,
+        dir.y * cos_x - dir.z * sin_x,
+        dir.y * sin_x + dir.z * cos_x
+    );
+    
+    // Вращение вокруг оси Y (поворот влево/вправо)
+    float cos_y = cos(rot_y);
+    float sin_y = sin(rot_y);
+    float3 dir_xy = float3(
+        dir_x.x * cos_y + dir_x.z * sin_y,
+        dir_x.y,
+        -dir_x.x * sin_y + dir_x.z * cos_y
+    );
+    
+    // Вращение вокруг оси Z (наклон влево/вправо)
+    float cos_z = cos(rot_z);
+    float sin_z = sin(rot_z);
+    float3 dir_xyz = float3(
+        dir_xy.x * cos_z - dir_xy.y * sin_z,
+        dir_xy.x * sin_z + dir_xy.y * cos_z,
+        dir_xy.z
+    );
+    
+    return normalize(dir_xyz);
+}
+
 // Функция для преобразования направления луча в UV-координаты на сферической панораме
-float2 direction_to_equirect_uv(float3 direction)
+float2 direction_to_equirect_uv(float3 direction, float rot_x = 0.0, float rot_y = 0.0, float rot_z = 0.0)
 {
     // Нормализация направления
     float3 dir = normalize(direction);
+    
+    // Применяем вращение, если нужно
+    if (rot_x != 0.0 || rot_y != 0.0 || rot_z != 0.0) {
+        dir = rotate_direction(dir, rot_x, rot_y, rot_z);
+    }
     
     // Преобразование направления в сферические координаты
     float phi = atan2(dir.z, dir.x);
     float theta = asin(dir.y);
     
     // Преобразование в UV-координаты [0,1]
-    float u = (phi + 3.1415926) / (2.0 * 3.1415926);
-    float v = (theta + 3.1415926 / 2.0) / 3.1415926;
+    float u = (phi + PI) / (2.0 * PI);
+    float v = (theta + PI / 2.0) / PI;
     
     return float2(u, v);
 }
 
 // Функция для семплирования сферической панорамы
-float3 sample_environment(TensorView<float> env_texture, float3 direction, int env_width, int env_height)
+float3 sample_environment(TensorView<float> env_texture, float3 direction, int env_width, int env_height, 
+                          float rot_x = 0.0, float rot_y = 0.0, float rot_z = 0.0)
 {
-    // Получаем UV-координаты из направления луча
-    float2 uv = direction_to_equirect_uv(direction);
+    // Получаем UV-координаты из направления луча с учетом вращения
+    float2 uv = direction_to_equirect_uv(direction, rot_x, rot_y, rot_z);
     
     // Преобразуем UV в координаты текстуры
     int x = int(uv.x * env_width) % env_width;
@@ -331,38 +370,6 @@ float3 sample_environment(TensorView<float> env_texture, float3 direction, int e
     }
 }
 
-// Функция для генерации случайного направления в полусфере вокруг нормали
-float3 random_hemisphere_direction(float3 normal, uint seed)
-{
-    // Генерируем два случайных числа для сферических координат
-    float rand1 = RandomValue(seed);
-    uint seed2 = seed + 1;
-    float rand2 = RandomValue(seed2);
-    
-    // Преобразуем в направление в локальной системе координат полусферы
-    float cos_theta = sqrt(1.0 - rand1);
-    float sin_theta = sqrt(rand1);
-    float phi = 2.0 * 3.1415926 * rand2;
-    
-    float3 direction = float3(
-        sin_theta * cos(phi),
-        cos_theta,               // Y is up in local space
-        sin_theta * sin(phi)
-    );
-    
-    // Создаем ортонормированный базис вокруг нормали
-    float3 up = abs(normal.y) > 0.999 ? float3(1, 0, 0) : float3(0, 1, 0);
-    float3 tangent = normalize(cross(up, normal));
-    float3 bitangent = cross(normal, tangent);
-    
-    // Преобразуем из локальной системы координат в мировую
-    return normalize(
-        tangent * direction.x +
-        normal * direction.y +
-        bitangent * direction.z
-    );
-}
-
 [AutoPyBindCUDA]
 [CudaKernel]
 void render(TensorView<float> output,
@@ -377,11 +384,20 @@ void render(TensorView<float> output,
             int env_height,
             bool path_tracing,
             uint input_seed,
-            uint path_tracing_iters = 1)
+            uint path_tracing_iters = 1,
+            uint max_bounces = 10,
+            float env_rot_x = 0.0,
+            float env_rot_y = 0.0,
+            float env_rot_z = 0.0,
+            float plane_tiling_scale = 0.01,
+            float plane_offset_x = 0.1,
+            float plane_offset_y = 0.1)
 {
     uint3 gid = cudaBlockIdx() * cudaBlockDim() + cudaThreadIdx();
     if (gid.x >= output.size(0) || gid.y >= output.size(1)) return;
 
+    float2 plane_offset = float2(plane_offset_x, plane_offset_y);
+    
     CameraParams cam_params = PackCameraParams(inp_camera_params);
 
     // Screen dimensions
@@ -412,7 +428,7 @@ void render(TensorView<float> output,
     );
 
     // Итеративная трассировка лучей с ограниченной глубиной
-    const int MAX_BOUNCES = 2; // Максимальное количество отражений/преломлений
+    int MAX_BOUNCES = max_bounces; // Максимальное количество отражений/преломлений
 
     float3 mean_result_color = float3(0.0, 0.0, 0.0);
 
@@ -425,17 +441,18 @@ void render(TensorView<float> output,
         float3 attenuation = float3(1.0, 1.0, 1.0); // Текущее ослабление луча
         
         // Инициализируем seed для случайных чисел
-        uint seed = uint(gid.x + gid.y * output.size(0)) * 719393 + 1337 + i;
+        uint seed = uint(gid.x + gid.y * output.size(0)) * 719393 + 1337 * i;
         
         // Итеративная трассировка с ограниченной глубиной
         for (int bounce = 0; bounce < MAX_BOUNCES; bounce++)
         {
-            HitInfo hit = raymarch(ray, objects, obj_count);
+            HitInfo hit = raymarch(ray, objects, obj_count, plane_tiling_scale, plane_offset);
             
             // Если луч не попал в объект, добавляем цвет фона и выходим
             if (!hit.didHit)
             {
-                float3 sky_color = sample_environment(env_texture, ray.dir, env_width, env_height); //float3(1.0, 1.0, 1.0); //
+                float3 sky_color = sample_environment(env_texture, ray.dir, env_width, env_height, 
+                                                     env_rot_x, env_rot_y, env_rot_z);
                 result_color = result_color + attenuation * sky_color;
                 break;
             }
@@ -460,12 +477,12 @@ void render(TensorView<float> output,
                     
                     // Ослабляем цвет по закону Ламберта (косинус угла между нормалью и направлением)
                     float cos_theta = dot(hit.normal, random_dir);
-                    attenuation = attenuation * material_color; //* cos_theta * 2.0;
+                    attenuation = attenuation * material_color * cos_theta * 2;
+                    float p = max(attenuation.r, max(attenuation.g, attenuation.b));
                 }
                 else
                 {
-                    float3 light_dir = normalize(float3(1.0, 1.0, 1.0));
-                    float diffuse = max(0.2, dot(hit.normal, light_dir));
+                    float diffuse = 1.0;
                     float3 ambient = float3(0.1, 0.1, 0.1);
                     
                     result_color = result_color + attenuation * material_color * (ambient + diffuse);
@@ -484,9 +501,7 @@ void render(TensorView<float> output,
                 
                 // В режиме обычного рейтрейсинга добавляем блик
                 if (!path_tracing) {
-                    float3 light_dir = normalize(float3(1.0, 1.0, 1.0));
-                    float light_reflection = pow(max(0.0, dot(reflect_dir, light_dir)), 8.0);
-                    result_color = result_color + attenuation * float3(1.0, 1.0, 0.9) * light_reflection * 0.2;
+                    result_color = result_color + attenuation * float3(1.0, 1.0, 0.9) * 0.2;
                 }
             }
             else if (material.type == MATERIAL_GLASS)
@@ -519,7 +534,7 @@ void render(TensorView<float> output,
             }
         }
         
-        //result_color = min(result_color, float3(1.0, 1.0, 1.0));
+        result_color = min(result_color, float3(1.0, 1.0, 1.0));
         mean_result_color += result_color;
     }
     mean_result_color = mean_result_color / path_tracing_iters;
@@ -541,10 +556,51 @@ float rand(float seed)
     return frac(a);
 }
 
-float RandomValue(inout uint state)
+uint NextRandom(inout uint state)
 {
     state = state * 747796405 + 2891336453;
     uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
     result = (result >> 22) ^ result;
-    return result / 4294967295.0;
+    return result;
+}
+
+float RandomValue(inout uint state)
+{
+    return NextRandom(state) / 4294967295.0; // 2^32 - 1
+}
+
+// Random value in normal distribution (with mean=0 and sd=1)
+float RandomValueNormalDistribution(inout uint state)
+{
+    // Thanks to https://stackoverflow.com/a/6178290
+    float theta = 2 * 3.1415926 * RandomValue(state);
+    float rho = sqrt(-2 * log(RandomValue(state)));
+    return rho * cos(theta);
+}
+
+// Calculate a random direction
+float3 RandomDirection(inout uint state)
+{
+    // Thanks to https://math.stackexchange.com/a/1585996
+    float x = RandomValueNormalDistribution(state);
+    float y = RandomValueNormalDistribution(state);
+    float z = RandomValueNormalDistribution(state);
+    return normalize(float3(x, y, z));
+}
+
+float2 RandomPointInCircle(inout uint rngState)
+{
+    float angle = RandomValue(rngState) * 2 * PI;
+    float2 pointOnCircle = float2(cos(angle), sin(angle));
+    return pointOnCircle * sqrt(RandomValue(rngState));
+}
+
+float2 mod2(float2 x, float2 y)
+{
+    return x - y * floor(x/y);
+}
+
+float3 random_hemisphere_direction(float3 normal, uint seed){
+    float3 dir = RandomDirection(seed);
+    return dir * sign(dot(normal, dir));
 }
