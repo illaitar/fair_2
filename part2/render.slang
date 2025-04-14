@@ -258,7 +258,7 @@ Material get_material(TensorView<float> materials, int material_id, int material
             materials[material_id, 2], 
             materials[material_id, 3]
         );
-        mat.has_texture = materials[material_id, 4] > 0.0;
+        mat.has_texture = true;
         mat.param1 = materials[material_id, 5];
         mat.param2 = materials[material_id, 6];
     }
@@ -477,15 +477,18 @@ void render(TensorView<float> output,
                     
                     // Ослабляем цвет по закону Ламберта (косинус угла между нормалью и направлением)
                     float cos_theta = dot(hit.normal, random_dir);
-                    attenuation = attenuation * material_color * cos_theta * 2;
-                    float p = max(attenuation.r, max(attenuation.g, attenuation.b));
+                    result_color += attenuation * material_color * cos_theta / 2;
+                    attenuation = attenuation * material_color;
                 }
                 else
                 {
-                    float diffuse = 1.0;
-                    float3 ambient = float3(0.1, 0.1, 0.1);
+                    // Используем окружение как источник света
+                    // Простое диффузное освещение без прямой выборки из окружения
+                    float3 ambient = float3(0.2, 0.2, 0.2);
                     
-                    result_color = result_color + attenuation * material_color * (ambient + diffuse);
+                    // Добавляем вклад окружения в результирующий цвет 
+                    // с более нейтральным освещением
+                    result_color = result_color + attenuation * material_color;
                     break;
                 }
             }
@@ -499,9 +502,8 @@ void render(TensorView<float> output,
                 
                 attenuation = attenuation * material_color;
                 
-                // В режиме обычного рейтрейсинга добавляем блик
+                // В режиме обычного рейтрейсинга добавляем блик от окружения
                 if (!path_tracing) {
-                    result_color = result_color + attenuation * float3(1.0, 1.0, 0.9) * 0.2;
                 }
             }
             else if (material.type == MATERIAL_GLASS)
@@ -531,6 +533,9 @@ void render(TensorView<float> output,
                 
                 // Учитываем цвет стекла в ослаблении
                 attenuation = attenuation * material_color;
+            }
+            if (bounce == (MAX_BOUNCES-1)){
+                result_color = float3(0.0, 0.0, 0.0);
             }
         }
         
