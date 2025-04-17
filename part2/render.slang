@@ -370,6 +370,7 @@ float3 sample_environment(TensorView<float> env_texture, float3 direction, int e
     }
 }
 
+
 [AutoPyBindCUDA]
 [CudaKernel]
 void render(TensorView<float> output,
@@ -391,7 +392,9 @@ void render(TensorView<float> output,
             float env_rot_z = 0.0,
             float plane_tiling_scale = 0.01,
             float plane_offset_x = 0.1,
-            float plane_offset_y = 0.1)
+            float plane_offset_y = 0.1,
+            int target_material_id = -1,
+            TensorView<float> max_contribution_map)
 {
     uint3 gid = cudaBlockIdx() * cudaBlockDim() + cudaThreadIdx();
     if (gid.x >= output.size(0) || gid.y >= output.size(1)) return;
@@ -477,7 +480,43 @@ void render(TensorView<float> output,
                     
                     // Ослабляем цвет по закону Ламберта (косинус угла между нормалью и направлением)
                     float cos_theta = dot(hit.normal, random_dir);
-                    result_color += attenuation * material_color * cos_theta / 2;
+                    result_color += attenuation * material_color * cos_theta;
+                    
+                    // Трекинг вклада текстуры для целевого материала
+                    if (hit.material_id == target_material_id && material.has_texture && hit.has_texture && target_material_id != -1) {
+                        // Вычисляем пиксельные координаты текстуры
+                        float2 uv = float2(frac(hit.uv.x), frac(hit.uv.y));
+                        int tx = int(uv.x * hit.texture_width);
+                        int ty = int(uv.y * hit.texture_height);
+                        tx = min(max(tx, 0), int(hit.texture_width) - 1);
+                        ty = min(max(ty, 0), int(hit.texture_height) - 1);
+                        
+                        // Вклад этого пикселя текстуры в текущий пиксель изображения
+                        float3 contribution = attenuation * cos_theta;
+                        
+                        // Индекс пикселя текстуры в буфере (tx, ty)
+                        int texture_idx = ty * int(hit.texture_width) + tx;
+                        
+                        // Проверяем, больше ли текущий вклад чем сохраненный максимум
+                        float current_max_contribution = max_contribution_map[texture_idx, 2] + 
+                                                        max_contribution_map[texture_idx, 3] + 
+                                                        max_contribution_map[texture_idx, 4];
+                        
+                        float new_contribution = contribution.x + contribution.y + contribution.z;
+                        
+                        // Если новый вклад больше сохраненного максимума, обновляем данные
+                        if (new_contribution > current_max_contribution) {
+                            // Сохраняем координаты пикселя изображения
+                            max_contribution_map[texture_idx, 0] = float(gid.x);  // X координата пикселя изображения
+                            max_contribution_map[texture_idx, 1] = float(gid.y);  // Y координата пикселя изображения
+                            
+                            // Сохраняем значения вклада для каждого канала
+                            max_contribution_map[texture_idx, 2] = contribution.x;  // R
+                            max_contribution_map[texture_idx, 3] = contribution.y;  // G
+                            max_contribution_map[texture_idx, 4] = contribution.z;  // B
+                        }
+                    }
+                    
                     attenuation = attenuation * material_color;
                 }
                 else
@@ -500,6 +539,41 @@ void render(TensorView<float> output,
                 ray.origin = hit.hitPoint + hit.normal * 0.001; // Небольшое смещение для избежания самопересечения
                 ray.dir = reflect_dir;
                 
+                // Трекинг вклада текстуры для целевого материала в отражениях
+                if (hit.material_id == target_material_id && material.has_texture && hit.has_texture && target_material_id != -1) {
+                    // Вычисляем пиксельные координаты текстуры
+                    float2 uv = float2(frac(hit.uv.x), frac(hit.uv.y));
+                    int tx = int(uv.x * hit.texture_width);
+                    int ty = int(uv.y * hit.texture_height);
+                    tx = min(max(tx, 0), int(hit.texture_width) - 1);
+                    ty = min(max(ty, 0), int(hit.texture_height) - 1);
+                    
+                    // Вклад этого пикселя текстуры через зеркальное отражение
+                    float3 contribution = attenuation;
+                    
+                    // Индекс пикселя текстуры в буфере (tx, ty)
+                    int texture_idx = ty * int(hit.texture_width) + tx;
+                    
+                    // Проверяем, больше ли текущий вклад чем сохраненный максимум
+                    float current_max_contribution = max_contribution_map[texture_idx, 2] + 
+                                                    max_contribution_map[texture_idx, 3] + 
+                                                    max_contribution_map[texture_idx, 4];
+                    
+                    float new_contribution = contribution.x + contribution.y + contribution.z;
+                    
+                    // Если новый вклад больше сохраненного максимума, обновляем данные
+                    if (new_contribution > current_max_contribution) {
+                        // Сохраняем координаты пикселя изображения
+                        max_contribution_map[texture_idx, 0] = float(gid.x);  // X координата пикселя изображения
+                        max_contribution_map[texture_idx, 1] = float(gid.y);  // Y координата пикселя изображения
+                        
+                        // Сохраняем значения вклада для каждого канала
+                        max_contribution_map[texture_idx, 2] = contribution.x;  // R
+                        max_contribution_map[texture_idx, 3] = contribution.y;  // G
+                        max_contribution_map[texture_idx, 4] = contribution.z;  // B
+                    }
+                }
+                
                 attenuation = attenuation * material_color;
                 
                 // В режиме обычного рейтрейсинга добавляем блик от окружения
@@ -514,6 +588,41 @@ void render(TensorView<float> output,
                 
                 // Вычисляем коэффициент Френеля
                 float fresnel = 0.1 + 0.9 * pow(1.0 - max(0.0, -dot(ray.dir, hit.normal)), 5.0);
+                
+                // Трекинг вклада текстуры для стеклянного материала
+                if (hit.material_id == target_material_id && material.has_texture && hit.has_texture && target_material_id != -1) {
+                    // Вычисляем пиксельные координаты текстуры
+                    float2 uv = float2(frac(hit.uv.x), frac(hit.uv.y));
+                    int tx = int(uv.x * hit.texture_width);
+                    int ty = int(uv.y * hit.texture_height);
+                    tx = min(max(tx, 0), int(hit.texture_width) - 1);
+                    ty = min(max(ty, 0), int(hit.texture_height) - 1);
+                    
+                    // Вклад этого пикселя текстуры через стекло
+                    float3 contribution = attenuation;
+                    
+                    // Индекс пикселя текстуры в буфере (tx, ty)
+                    int texture_idx = ty * int(hit.texture_width) + tx;
+                    
+                    // Проверяем, больше ли текущий вклад чем сохраненный максимум
+                    float current_max_contribution = max_contribution_map[texture_idx, 2] + 
+                                                    max_contribution_map[texture_idx, 3] + 
+                                                    max_contribution_map[texture_idx, 4];
+                    
+                    float new_contribution = contribution.x + contribution.y + contribution.z;
+                    
+                    // Если новый вклад больше сохраненного максимума, обновляем данные
+                    if (new_contribution > current_max_contribution) {
+                        // Сохраняем координаты пикселя изображения
+                        max_contribution_map[texture_idx, 0] = float(gid.x);  // X координата пикселя изображения
+                        max_contribution_map[texture_idx, 1] = float(gid.y);  // Y координата пикселя изображения
+                        
+                        // Сохраняем значения вклада для каждого канала
+                        max_contribution_map[texture_idx, 2] = contribution.x;  // R
+                        max_contribution_map[texture_idx, 3] = contribution.y;  // G
+                        max_contribution_map[texture_idx, 4] = contribution.z;  // B
+                    }
+                }
                 
                 // Решаем, будет ли отражение или преломление на основе коэффициента Френеля
                 if (bounce == MAX_BOUNCES - 1 || RandomValue(seed) < fresnel)
@@ -608,4 +717,27 @@ float2 mod2(float2 x, float2 y)
 float3 random_hemisphere_direction(float3 normal, uint seed){
     float3 dir = RandomDirection(seed);
     return dir * sign(dot(normal, dir));
+}
+
+[AutoPyBindCUDA]
+[CudaKernel]
+[Differentiable]
+void mse_loss(DiffTensorView<float> input, TensorView<float> reference, DiffTensorView<float> output)
+{
+    uint3 globalIdx = cudaBlockIdx() * cudaBlockDim() + cudaThreadIdx();
+
+    if (globalIdx.x >= output.size(0) ||
+        globalIdx.y >= output.size(1))
+        return;
+
+    float diff_r = input.load(int3(globalIdx.x, globalIdx.y, 0)) - no_diff(reference[globalIdx.x, globalIdx.y, 0]);
+    float diff_g = input.load(int3(globalIdx.x, globalIdx.y, 1)) - no_diff(reference[globalIdx.x, globalIdx.y, 1]);
+    float diff_b = input.load(int3(globalIdx.x, globalIdx.y, 2)) - no_diff(reference[globalIdx.x, globalIdx.y, 2]);
+
+    float mse_r = diff_r * diff_r;
+    float mse_g = diff_g * diff_g;
+    float mse_b = diff_b * diff_b;
+    output.store(int3(globalIdx.x, globalIdx.y, 0), mse_r);
+    output.store( int3(globalIdx.x, globalIdx.y, 1), mse_g);
+    output.store(int3(globalIdx.x, globalIdx.y, 2), mse_b);
 }
