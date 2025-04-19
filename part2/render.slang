@@ -177,6 +177,17 @@ float3 sample_texture(TensorView<float> textures, float texture_offset, float te
         return float3(1, 0, 1); // Пурпурный для отладки
 }
 
+[Differentiable]
+float3 sample_texture_diff(DiffTensorView<float> target_texture, float texture_offset, float texture_width, float texture_height, float2 uv)
+{
+    uv = float2(frac(uv.x), frac(uv.y));
+    int x = int(uv.x * texture_width);
+    int y = int(uv.y * texture_height);
+    x = min(max(x, 0), int(texture_width) - 1);
+    y = min(max(y, 0), int(texture_height) - 1);
+    return float3(target_texture[x, y, 0], target_texture[x, y, 1], target_texture[x, y, 2]);
+}
+
 struct Ray
 {
     float3 origin;
@@ -267,21 +278,41 @@ Material get_material(TensorView<float> materials, int material_id, int material
 }
 
 // Функция для отражения луча
+[Differentiable]
 float3 reflect_ray(float3 incident, float3 normal)
 {
     return incident - 2.0 * dot(incident, normal) * normal;
 }
 
-// Функция для преломления луча
+// Функция для преломления луча с обработкой полного внутреннего отражения
+[Differentiable]
 float3 refract_ray(float3 incident, float3 normal, float eta)
 {
-    float cos_i = -dot(normal, incident);
-    float cos_t2 = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+    // Определяем, входит луч в объект или выходит
+    float cos_i = dot(normal, incident);
     
-    if (cos_t2 > 0.0) {
-        return eta * incident + (eta * cos_i - sqrt(cos_t2)) * normal;
+    // Начальные значения
+    float3 n = normal;
+    float actual_eta = eta;
+    
+    // Если луч входит в объект (cos_i < 0), сохраняем нормаль и eta
+    // Если луч выходит из объекта (cos_i > 0), инвертируем нормаль и eta
+    if (cos_i > 0) {
+        n = -normal;  // Инвертируем нормаль
+        actual_eta = 1.0 / eta;  // Инвертируем eta при выходе из среды
     }
     
+    // Вычисляем cos theta_t в квадрате по формуле Снеллиуса
+    cos_i = abs(cos_i);  // Используем абсолютное значение косинуса
+    float cos_t2 = 1.0 - actual_eta * actual_eta * (1.0 - cos_i * cos_i);
+    
+    // Проверка на полное внутреннее отражение
+    if (cos_t2 > 0.0) {
+        // Обычное преломление по закону Снеллиуса
+        return actual_eta * incident + (actual_eta * cos_i - sqrt(cos_t2)) * n;
+    }
+    
+    // В случае полного внутреннего отражения используем отражение
     return reflect_ray(incident, normal);
 }
 
@@ -370,10 +401,10 @@ float3 sample_environment(TensorView<float> env_texture, float3 direction, int e
     }
 }
 
-
+[Differentiable]
 [AutoPyBindCUDA]
 [CudaKernel]
-void render(TensorView<float> output,
+void render(DiffTensorView<float> output,
             TensorView<float> objects,
             int obj_count,
             InputCameraParams inp_camera_params,
@@ -387,13 +418,14 @@ void render(TensorView<float> output,
             uint input_seed,
             uint path_tracing_iters = 1,
             uint max_bounces = 10,
-            float env_rot_x = 0.0,
-            float env_rot_y = 0.0,
-            float env_rot_z = 0.0,
-            float plane_tiling_scale = 0.01,
-            float plane_offset_x = 0.1,
-            float plane_offset_y = 0.1,
+            no_diff float env_rot_x = 0.0,
+            no_diff float env_rot_y = 0.0,
+            no_diff float env_rot_z = 0.0,
+            no_diff float plane_tiling_scale = 0.01,
+            no_diff float plane_offset_x = 0.1,
+            no_diff float plane_offset_y = 0.1,
             int target_material_id = -1,
+            DiffTensorView<float> target_texture,
             TensorView<float> max_contribution_map)
 {
     uint3 gid = cudaBlockIdx() * cudaBlockDim() + cudaThreadIdx();
@@ -403,24 +435,19 @@ void render(TensorView<float> output,
     
     CameraParams cam_params = PackCameraParams(inp_camera_params);
 
-    // Screen dimensions
     float2 res = float2(output.size(0), output.size(1));
     float aspect = res.x / res.y;
     
-    // Convert vertical FOV from degrees to radians
     float vfov_rad = radians(cam_params.vfov);
     
-    // Camera setup with orthonormal basis
     float3 cam_pos = cam_params.pos;
     float3 cam_forward = normalize(cam_params.look_at - cam_pos);
     float3 cam_right = normalize(cross(cam_forward, cam_params.up));
     float3 cam_up = normalize(cross(cam_right, cam_forward));
     
-    // Screen coordinates in [-1,1] range
     float x = (2.0 * (float(gid.x) + 0.5) / res.x - 1.0);
     float y = (1.0 - 2.0 * (float(gid.y) + 0.5) / res.y);
     
-    // Calculate camera image plane distance for FOV
     float image_plane_dist = 1.0 / tan(vfov_rad * 0.5);
     
     // Calculate ray direction 
@@ -430,11 +457,11 @@ void render(TensorView<float> output,
         cam_up * y
     );
 
-    // Итеративная трассировка лучей с ограниченной глубиной
-    int MAX_BOUNCES = max_bounces; // Максимальное количество отражений/преломлений
+    int MAX_BOUNCES = max_bounces;
 
     float3 mean_result_color = float3(0.0, 0.0, 0.0);
 
+    [MaxIters(100)]
     for (int i = 0; i < path_tracing_iters; i++){
         // Начальные значения луча
         Ray ray;
@@ -446,6 +473,8 @@ void render(TensorView<float> output,
         // Инициализируем seed для случайных чисел
         uint seed = uint(gid.x + gid.y * output.size(0)) * 719393 + 1337 * i;
         
+        
+        [MaxIters(20)]
         // Итеративная трассировка с ограниченной глубиной
         for (int bounce = 0; bounce < MAX_BOUNCES; bounce++)
         {
@@ -454,7 +483,7 @@ void render(TensorView<float> output,
             // Если луч не попал в объект, добавляем цвет фона и выходим
             if (!hit.didHit)
             {
-                float3 sky_color = sample_environment(env_texture, ray.dir, env_width, env_height, 
+                no_diff float3 sky_color = no_diff sample_environment(env_texture, ray.dir, env_width, env_height, 
                                                      env_rot_x, env_rot_y, env_rot_z);
                 result_color = result_color + attenuation * sky_color;
                 break;
@@ -465,7 +494,11 @@ void render(TensorView<float> output,
             // Базовый цвет материала (с учетом текстуры, если она есть)
             float3 material_color = material.color;
             if (material.has_texture && hit.has_texture) {
-                material_color = sample_texture(textures, hit.texture_offset, hit.texture_width, hit.texture_height, hit.uv);
+                if (hit.material_id == target_material_id){
+                    material_color = sample_texture_diff(target_texture, hit.texture_offset, hit.texture_width, hit.texture_height, hit.uv);
+                } else {
+                    material_color =  no_diff sample_texture(textures, hit.texture_offset, hit.texture_width, hit.texture_height, hit.uv);
+                }
             }
             
             // Обработка в зависимости от типа материала
@@ -473,49 +506,16 @@ void render(TensorView<float> output,
             {
                 if (path_tracing)
                 {
-                    float3 random_dir = random_hemisphere_direction(hit.normal, seed);
+                    float3 random_dir = no_diff random_hemisphere_direction(hit.normal, seed);
                     
                     ray.origin = hit.hitPoint + hit.normal * 0.001; // Небольшое смещение
                     ray.dir = random_dir;
                     
-                    // Ослабляем цвет по закону Ламберта (косинус угла между нормалью и направлением)
+                    // Правильная физическая BRDF для диффузного материала (Ламберта)
                     float cos_theta = dot(hit.normal, random_dir);
-                    result_color += attenuation * material_color * cos_theta;
                     
-                    // Трекинг вклада текстуры для целевого материала
-                    if (hit.material_id == target_material_id && material.has_texture && hit.has_texture && target_material_id != -1) {
-                        // Вычисляем пиксельные координаты текстуры
-                        float2 uv = float2(frac(hit.uv.x), frac(hit.uv.y));
-                        int tx = int(uv.x * hit.texture_width);
-                        int ty = int(uv.y * hit.texture_height);
-                        tx = min(max(tx, 0), int(hit.texture_width) - 1);
-                        ty = min(max(ty, 0), int(hit.texture_height) - 1);
-                        
-                        // Вклад этого пикселя текстуры в текущий пиксель изображения
-                        float3 contribution = attenuation * cos_theta;
-                        
-                        // Индекс пикселя текстуры в буфере (tx, ty)
-                        int texture_idx = ty * int(hit.texture_width) + tx;
-                        
-                        // Проверяем, больше ли текущий вклад чем сохраненный максимум
-                        float current_max_contribution = max_contribution_map[texture_idx, 2] + 
-                                                        max_contribution_map[texture_idx, 3] + 
-                                                        max_contribution_map[texture_idx, 4];
-                        
-                        float new_contribution = contribution.x + contribution.y + contribution.z;
-                        
-                        // Если новый вклад больше сохраненного максимума, обновляем данные
-                        if (new_contribution > current_max_contribution) {
-                            // Сохраняем координаты пикселя изображения
-                            max_contribution_map[texture_idx, 0] = float(gid.x);  // X координата пикселя изображения
-                            max_contribution_map[texture_idx, 1] = float(gid.y);  // Y координата пикселя изображения
-                            
-                            // Сохраняем значения вклада для каждого канала
-                            max_contribution_map[texture_idx, 2] = contribution.x;  // R
-                            max_contribution_map[texture_idx, 3] = contribution.y;  // G
-                            max_contribution_map[texture_idx, 4] = contribution.z;  // B
-                        }
-                    }
+                    // Используем /PI для физически корректного рендеринга
+                    result_color += attenuation * material_color * cos_theta / PI;
                     
                     attenuation = attenuation * material_color;
                 }
@@ -539,111 +539,35 @@ void render(TensorView<float> output,
                 ray.origin = hit.hitPoint + hit.normal * 0.001; // Небольшое смещение для избежания самопересечения
                 ray.dir = reflect_dir;
                 
-                // Трекинг вклада текстуры для целевого материала в отражениях
-                if (hit.material_id == target_material_id && material.has_texture && hit.has_texture && target_material_id != -1) {
-                    // Вычисляем пиксельные координаты текстуры
-                    float2 uv = float2(frac(hit.uv.x), frac(hit.uv.y));
-                    int tx = int(uv.x * hit.texture_width);
-                    int ty = int(uv.y * hit.texture_height);
-                    tx = min(max(tx, 0), int(hit.texture_width) - 1);
-                    ty = min(max(ty, 0), int(hit.texture_height) - 1);
-                    
-                    // Вклад этого пикселя текстуры через зеркальное отражение
-                    float3 contribution = attenuation;
-                    
-                    // Индекс пикселя текстуры в буфере (tx, ty)
-                    int texture_idx = ty * int(hit.texture_width) + tx;
-                    
-                    // Проверяем, больше ли текущий вклад чем сохраненный максимум
-                    float current_max_contribution = max_contribution_map[texture_idx, 2] + 
-                                                    max_contribution_map[texture_idx, 3] + 
-                                                    max_contribution_map[texture_idx, 4];
-                    
-                    float new_contribution = contribution.x + contribution.y + contribution.z;
-                    
-                    // Если новый вклад больше сохраненного максимума, обновляем данные
-                    if (new_contribution > current_max_contribution) {
-                        // Сохраняем координаты пикселя изображения
-                        max_contribution_map[texture_idx, 0] = float(gid.x);  // X координата пикселя изображения
-                        max_contribution_map[texture_idx, 1] = float(gid.y);  // Y координата пикселя изображения
-                        
-                        // Сохраняем значения вклада для каждого канала
-                        max_contribution_map[texture_idx, 2] = contribution.x;  // R
-                        max_contribution_map[texture_idx, 3] = contribution.y;  // G
-                        max_contribution_map[texture_idx, 4] = contribution.z;  // B
-                    }
-                }
-                
                 attenuation = attenuation * material_color;
-                
-                // В режиме обычного рейтрейсинга добавляем блик от окружения
-                if (!path_tracing) {
-                }
             }
             else if (material.type == MATERIAL_GLASS)
             {
-                // Стеклянный материал (преломление с учетом френеля)
+                // Идеальное стекло без эффекта Френеля
                 float refraction_index = max(1.01, material.param1);
                 if (refraction_index < 1.01) refraction_index = 1.5; // По умолчанию для стекла
                 
-                // Вычисляем коэффициент Френеля
-                float fresnel = 0.1 + 0.9 * pow(1.0 - max(0.0, -dot(ray.dir, hit.normal)), 5.0);
+                // Определяем, входит луч в объект или выходит
+                float cos_i = dot(hit.normal, ray.dir);
+                float3 normal = hit.normal;
+                float offset = 0.001;
                 
-                // Трекинг вклада текстуры для стеклянного материала
-                if (hit.material_id == target_material_id && material.has_texture && hit.has_texture && target_material_id != -1) {
-                    // Вычисляем пиксельные координаты текстуры
-                    float2 uv = float2(frac(hit.uv.x), frac(hit.uv.y));
-                    int tx = int(uv.x * hit.texture_width);
-                    int ty = int(uv.y * hit.texture_height);
-                    tx = min(max(tx, 0), int(hit.texture_width) - 1);
-                    ty = min(max(ty, 0), int(hit.texture_height) - 1);
-                    
-                    // Вклад этого пикселя текстуры через стекло
-                    float3 contribution = attenuation;
-                    
-                    // Индекс пикселя текстуры в буфере (tx, ty)
-                    int texture_idx = ty * int(hit.texture_width) + tx;
-                    
-                    // Проверяем, больше ли текущий вклад чем сохраненный максимум
-                    float current_max_contribution = max_contribution_map[texture_idx, 2] + 
-                                                    max_contribution_map[texture_idx, 3] + 
-                                                    max_contribution_map[texture_idx, 4];
-                    
-                    float new_contribution = contribution.x + contribution.y + contribution.z;
-                    
-                    // Если новый вклад больше сохраненного максимума, обновляем данные
-                    if (new_contribution > current_max_contribution) {
-                        // Сохраняем координаты пикселя изображения
-                        max_contribution_map[texture_idx, 0] = float(gid.x);  // X координата пикселя изображения
-                        max_contribution_map[texture_idx, 1] = float(gid.y);  // Y координата пикселя изображения
-                        
-                        // Сохраняем значения вклада для каждого канала
-                        max_contribution_map[texture_idx, 2] = contribution.x;  // R
-                        max_contribution_map[texture_idx, 3] = contribution.y;  // G
-                        max_contribution_map[texture_idx, 4] = contribution.z;  // B
-                    }
+                // Если cos_i > 0, луч выходит из объекта
+                if (cos_i > 0) {
+                    // Выходящий луч - инвертируем нормаль
+                    offset = -offset; // Смещаемся в противоположную сторону
                 }
                 
-                // Решаем, будет ли отражение или преломление на основе коэффициента Френеля
-                if (bounce == MAX_BOUNCES - 1 || RandomValue(seed) < fresnel)
-                {
-                    // Отражение (как у зеркала)
-                    float3 reflect_dir = reflect_ray(ray.dir, hit.normal);
-                    ray.origin = hit.hitPoint + hit.normal * 0.001;
-                    ray.dir = reflect_dir;
-                }
-                else
-                {
-                    // Преломление
-                    float3 refract_dir = refract_ray(ray.dir, hit.normal, 1.0 / refraction_index);
-                    ray.origin = hit.hitPoint - hit.normal * 0.001;
-                    ray.dir = refract_dir;
-                }
+                // Преломление с обработкой потенциального полного внутреннего отражения
+                float3 refract_dir = refract_ray(ray.dir, normal, 1.0 / refraction_index);
+                ray.origin = hit.hitPoint + offset * normal;
+                ray.dir = refract_dir;
                 
-                // Учитываем цвет стекла в ослаблении
+                // Для идеального стекла - минимальное поглощение 
+                // (только цвет стекла влияет на атеннюацию)
                 attenuation = attenuation * material_color;
             }
-            if (bounce == (MAX_BOUNCES-1)){
+            if (bounce == (actual_max_bounces-1)){
                 result_color = float3(0.0, 0.0, 0.0);
             }
         }
